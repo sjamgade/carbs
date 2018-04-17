@@ -10,6 +10,8 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 from pycuda.compiler import SourceModule
 
+from jinja2 import Template
+
 #cuda.initialize_profiler()
 
 UNIX_UNIVERSAL_START64 = numpy.datetime64("1970", 'ns')
@@ -145,10 +147,10 @@ class AggregatedTimeSerie(TimeSerie):
         points = POINTS_PER_SPLIT * 1000
         points = 2 * 1024 * 6
         points = 512*1024*6
-        points = 1024*1024*7
+        points = 1024*1024*6
         points = int(points)
         sampling = numpy.timedelta64(5, 's')
-        resample = numpy.timedelta64(35, 's')
+        resample = numpy.timedelta64(30, 's')
 
         now = numpy.datetime64("2015-04-03 23:11")
         timestamps = numpy.sort(numpy.array( [now + i * sampling for i in six.moves.range(points)]))
@@ -201,80 +203,52 @@ class GroupedGpuBasedTimeSeries(object):
         self.a = self._ts['values']
         self.a = self.a.copy(order='C').astype(numpy.float32)
         self.junk = cuda.mem_alloc(self.a.dtype.itemsize)
+        self.reduce_by = int(self.granularity / numpy.timedelta64(5, 's'))
 
     def gpu_sum(self):
-        summod = SourceModule("""
-            /*
-            __global__ void v1(float *a, int *i) {
-              int perthread=i[0];
-              int counter = i[0]-1;
-              int col = blockIdx.x * blockDim.x + threadIdx.x;
-              int row = blockIdx.y * blockDim.y + threadIdx.y;
-              int index = col * perthread + row;
-              for(;counter;counter--)
-                  atomicAdd(a+index,  a[index+counter]);
-            }
-
-            __global__ void v2(float *a, int *i) {
-              int perthread=i[0];
-              int blklimit=1024;
-              int blk=1;
-              int row, col, index;
-              int counter = 0;
-              for (blk=1;blk<blklimit;blk++) {
-                  counter = perthread-1;
-                  col = blockIdx.x * blockDim.x + threadIdx.x + blockDim.x*blk*perthread;
-                  row = blockIdx.y * blockDim.y + threadIdx.y;
+        tpl = Template("""
+                __global__ void v3(float *a, float *op) {
+                  int perthread= {{ perthread }};
+                  int col, index, counter;
+                  extern __shared__ float inter[];
+                  col = blockIdx.x * blockDim.x + threadIdx.x;
                   int tid = threadIdx.x;
-                  int x = 0;
-                  for(;counter;counter--){
-                      x += a[index + counter];
+                  #pragma unroll
+                  for(counter=0;counter<perthread;counter++){
+                      index = col + blockDim.x*counter;
+                      inter[blockDim.x * counter + tid] = a[index];
                   }
-                  a[index] = x;
-              }
-            }
-            */
 
-            __global__ void v3(float *a, int *i) {
-              int perthread=i[0];
-              int row, col, index, counter;
-              extern __shared__ float inter[];
-              col = blockIdx.x * blockDim.x + threadIdx.x;
-              row = blockIdx.y * blockDim.y + threadIdx.y;
-              int tid = threadIdx.x;
-              for(counter=0;counter<perthread;counter++){
-                  index = col + blockDim.x*counter + row;
-                  inter[blockDim.x * counter + tid] = a[index];
-              }
+                  __syncthreads();
+                  int x = 0;
+                  #pragma unroll
+                  for(counter=0;counter<perthread;counter++){
+                      x += inter[perthread*tid + counter];
+                  }
+                  op[col] = x;
+                }
+                """)
+        ren_tpl = tpl.render(perthread=self.reduce_by)
+        summod = SourceModule(ren_tpl, options=['--generate-line-info'], keep=True)
 
-              __syncthreads();
-              int x = 0;
-              for(counter=0;counter<perthread;counter++){
-                  x += inter[perthread*tid + counter];
-              }
-              a[index] = x;
-            }
-            """, options=['--generate-line-info'], keep=True)
-
-        self.reduce_by = int(self.granularity / numpy.timedelta64(5, 's'))
         func = summod.get_function("v3")
-        #func(self.a_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1), grid=(512, 1))
-        #func(self.a_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1), grid=(1024, 1))
         t0 = time.time()
         cuda.start_profiler()
-        self.a_gpu = cuda.mem_alloc(self.a.size * self.a.dtype.itemsize)
-        cuda.memcpy_htod(self.a_gpu, self.a)
-        #func(self.a_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1))
+        in_gpu = cuda.mem_alloc(self.a.size * self.a.dtype.itemsize)
+        cuda.memcpy_htod(in_gpu, self.a)
+        ret_gpu = cuda.mem_alloc(int(self.a.size* self.a.dtype.itemsize / self.reduce_by))
         gridsize = 1024
-        func(self.a_gpu, cuda.In(numpy.array(self.reduce_by)),
+        func(in_gpu, ret_gpu,
                 block=(1024, 1, 1), grid=(gridsize, 1),
                 shared=1024*self.reduce_by*self.a.dtype.itemsize
                 )
-        a_doubled = cuda.from_device_like(self.a_gpu, self.a)
+        ret = numpy.empty(self.a.size / self.reduce_by, numpy.float32)
+        cuda.memcpy_dtoh(ret, ret_gpu)
+        dat = make_timeseries(self.tstamps, ret)
         cuda.stop_profiler()
         t1 = time.time()
         print("gpu %0.7f" % (1000*(t1-t0)))
-        return a_doubled
+        return dat
 
     def cpu_sum(self):
         t0 = time.time()
