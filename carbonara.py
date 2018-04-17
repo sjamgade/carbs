@@ -7,8 +7,11 @@ import numpy
 import re
 import struct
 import pycuda.driver as cuda
-import pycuda.autoinit
 from pycuda.compiler import SourceModule
+
+cuda.init()
+
+from threading import Thread
 
 #cuda.initialize_profiler()
 
@@ -145,10 +148,12 @@ class AggregatedTimeSerie(TimeSerie):
         points = POINTS_PER_SPLIT * 1000
         points = 2 * 1024 * 6
         points = 512*1024*6
-        points = 1024*1024*7
-        points = int(points)
+        points = 1024*1024
         sampling = numpy.timedelta64(5, 's')
         resample = numpy.timedelta64(35, 's')
+        points = 1024 * 1024 * (resample / numpy.timedelta64(5, 's'))
+        points = 1024 * 1024 * 7
+        points = int(points)
 
         now = numpy.datetime64("2015-04-03 23:11")
         timestamps = numpy.sort(numpy.array( [now + i * sampling for i in six.moves.range(points)]))
@@ -202,7 +207,7 @@ class GroupedGpuBasedTimeSeries(object):
         self.data = cuda.pagelocked_empty_like(self._ts['values'].copy(order='C').astype(numpy.float32))
         self.data[:] = self._ts['values'].copy(order='C').astype(numpy.float32)[:]
         #self.data_gpu = cuda.mem_alloc(self.data.size * self.data.dtype.itemsize)
-        self.reduce_by = (self.granularity / numpy.timedelta64(5, 's'))
+        self.reduce_by = int(self.granularity / numpy.timedelta64(5, 's'))
         total_size = int(self.data.size * self.data.dtype.itemsize / self.reduce_by)
         self.output = cuda.pagelocked_empty(total_size, self.data.dtype)
         #self.op_gpu = cuda.mem_alloc(total_size)
@@ -268,7 +273,6 @@ class GroupedGpuBasedTimeSeries(object):
               }
             }
 
-            */
             __global__ void v4(float *data, int *i, float *output) {
               int perthread=7;
               int blklimit=128;
@@ -297,20 +301,46 @@ class GroupedGpuBasedTimeSeries(object):
                   
               }
             }
+            */
+
+            __global__ void v5(float *data, int *i, float *output) {
+              int perthread=i[0];
+              int blklimit=1;
+              int blk=1;
+              int row, col, index;
+              extern __shared__ float inter[];
+              int counter = 0;
+              for (blk=0;blk<blklimit;blk++) {
+                  counter = perthread-1;
+                  col = blockIdx.x * blockDim.x + threadIdx.x + blockDim.x*blk*perthread;
+                  row = blockIdx.y * blockDim.y + threadIdx.y;
+                  int tid = threadIdx.x;
+                  for(counter=0;counter<perthread;counter++){
+                      index = col + blockDim.x*counter + row;
+                      inter[blockDim.x * counter + tid] = data[index];
+                  }
+                  __syncthreads();
+
+                  int x = 0;
+                  for(counter=0;counter<perthread;counter++){
+                      x += inter[blockDim.x * counter + tid];
+                  }
+                  index = col + row;
+                  output[tid] = x;
+                  __syncthreads();
+                  
+              }
+            }
             """, options=['--generate-line-info'], keep=True)
 
-        #t0 = time.time()
-        func = summod.get_function("v4")
-        eachblock_blksz = 128
-        each_stream = 1024 * 128
+        t0 = time.time()
+        func = summod.get_function("v5")
+        grid_sz = 128
+        each_stream = 1024 * grid_sz
         batches = 8
-        reduce_byarr = cuda.pagelocked_empty_like(numpy.array([self.reduce_by, eachblock_blksz]))
-        inputarray = cuda.mem_alloc(reduce_byarr.size * reduce_byarr.dtype.itemsize)
-        myStream = cuda.Stream()
-        cuda.memcpy_htod_async( inputarray, reduce_byarr, myStream)
         #func.prepare([numpy.float32]*3)
         holder = numpy.empty(each_stream , numpy.float32, "C")
-        stream_in_size = each_stream * self.data.dtype.itemsize * 7
+        stream_in_size = each_stream * self.data.dtype.itemsize * self.reduce_by
         stream_op_size = each_stream * self.data.dtype.itemsize
         #func(self.data_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1), grid=(512, 1))
         #func(self.data_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1), grid=(1024, 1))
@@ -318,19 +348,29 @@ class GroupedGpuBasedTimeSeries(object):
         self.data_gpu = []
         self.op_gpu = []
         cuda.start_profiler()
-        for counter in range(batches):
+        
+        def work(counter):
+            dev = cuda.Device(0)
+            ctx = dev.make_context()
+            
             stream = cuda.Stream()
             streams.append(stream)
 
-            self.data_gpu.append(cuda.mem_alloc(stream_in_size))
-            self.op_gpu.append(cuda.mem_alloc(stream_op_size))
+            reduce_byarr = cuda.pagelocked_empty_like(numpy.array([self.reduce_by, grid_sz]))
+            inputarray = cuda.mem_alloc(reduce_byarr.size * reduce_byarr.dtype.itemsize)
+            cuda.memcpy_htod_async( inputarray, reduce_byarr, stream)
+
+#            self.data_gpu.append(cuda.mem_alloc(stream_in_size))
+#            self.op_gpu.append(cuda.mem_alloc(stream_op_size))
+            data_gpu = cuda.mem_alloc(stream_in_size)
+            op_gpu = cuda.mem_alloc(stream_op_size)
 
 
-        for counter in range(batches):
+#        for counter in range(batches):
             cuda.memcpy_htod_async(
-                self.data_gpu[counter],
-                self.data[each_stream*7*counter:each_stream*7*(counter+1) ],
-                streams[counter])
+                data_gpu,
+                self.data[each_stream*self.reduce_by*counter:each_stream*self.reduce_by*(counter+1) ],
+                stream)
             #cuda.memcpy_htod(self.data_gpu, self.data)
             #func(self.data_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1))
 #        for counter in range(batches10):
@@ -339,34 +379,50 @@ class GroupedGpuBasedTimeSeries(object):
 #                 (each_stream/gridsize, 1, 1),
 #                 streams[counter],
 #                  self.data_gpu[counter], inputarray, self.op_gpu[counter],
-#                 shared_size=self.data.dtype.itemsize*7*each_stream,
+#                 shared_size=self.data.dtype.itemsize*self.reduce_by*each_stream,
 #                 )
-            func( self.data_gpu[counter], inputarray, self.op_gpu[counter],
-                grid=(1, 1),
-                 block=(each_stream/eachblock_blksz, 1, 1),
-                 stream=streams[counter],
-                 shared=self.data.dtype.itemsize*7*each_stream/eachblock_blksz,
-                 )
+#            func(data_gpu, inputarray, op_gpu,
+#                grid=(grid_sz, 1),
+#                 block=(each_stream/grid_sz, 1, 1),
+#                 stream=stream,
+#                 shared=self.data.dtype.itemsize*self.reduce_by*each_stream/grid_sz,
+#                 )
             
             #self.output[each_stream*counter:each_stream*(counter+1)] = cuda.from_device_like( self.op_gpu, holder, stream)
-        for counter in range(batches):
+#        for counter in range(batches):
             cuda.memcpy_dtoh_async(
                 self.output[each_stream*counter:each_stream*(counter+1)],
-                self.op_gpu[counter],
-                streams[counter])
+                op_gpu,
+                stream)
+            ctx.synchronize()
+            ctx.pop()
+            del data_gpu
+            del op_gpu
+            del dev
+
+        thds = []
+        for counter in range(batches):
+            thd = Thread(target=work, args=(counter,))
+            thds.append(thd)
+            thd.start()
+
+        for t in thds:
+            t.join()
+            
+
             #cuda.memcpy_dtoh(self.output, self.op_gpu)
-        [strm.synchronize() for strm in streams]
+        #[strm.synchronize() for strm in streams]
         cuda.stop_profiler()
-        #t1 = time.time()
-        #print("%0.7f" % (t1-t0))
+        t1 = time.time()
+        print("gpu_sum %0.7f" % (t1-t0))
         return 
 
     def cpu_sum(self):
-        #t0 = time.time()
+        t0 = time.time()
         dat = make_timeseries(self.tstamps, numpy.bincount(
             numpy.repeat(numpy.arange(self.counts.size), self.counts),
             weights=self._ts['values']))
-        #t1 = time.time()
-        #print("%0.7f" % (t1-t0))
+        t1 = time.time()
+        print("cpu_sum %0.7f" % (t1-t0))
         return dat
 AggregatedTimeSerie.benchmark()
