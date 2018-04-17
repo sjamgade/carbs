@@ -270,8 +270,8 @@ class GroupedGpuBasedTimeSeries(object):
 
             */
             __global__ void v4(float *data, int *i, float *output) {
-              int perthread=i[0];
-              int blklimit=1024/1024;
+              int perthread=7;
+              int blklimit=128;
               int blk=1;
               int row, col, index;
               extern __shared__ float inter[];
@@ -301,13 +301,14 @@ class GroupedGpuBasedTimeSeries(object):
 
         #t0 = time.time()
         func = summod.get_function("v4")
-        reduce_byarr = cuda.pagelocked_empty_like(numpy.array([self.reduce_by]))
+        eachblock_blksz = 128
+        each_stream = 1024 * 128
+        batches = 8
+        reduce_byarr = cuda.pagelocked_empty_like(numpy.array([self.reduce_by, eachblock_blksz]))
         inputarray = cuda.mem_alloc(reduce_byarr.size * reduce_byarr.dtype.itemsize)
         myStream = cuda.Stream()
         cuda.memcpy_htod_async( inputarray, reduce_byarr, myStream)
-        func.prepare([numpy.float32]*3)
-        each_stream = 1024
-        batches = 10
+        #func.prepare([numpy.float32]*3)
         holder = numpy.empty(each_stream , numpy.float32, "C")
         stream_in_size = each_stream * self.data.dtype.itemsize * 7
         stream_op_size = each_stream * self.data.dtype.itemsize
@@ -332,7 +333,6 @@ class GroupedGpuBasedTimeSeries(object):
                 streams[counter])
             #cuda.memcpy_htod(self.data_gpu, self.data)
             #func(self.data_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1))
-            gridsize=(4*4)/16
 #        for counter in range(batches10):
             #func.prepared_async_call(self.data_gpu[counter], inputarray, self.op_gpu[counter],
 #            func.prepared_async_call((gridsize, 1),
@@ -342,14 +342,14 @@ class GroupedGpuBasedTimeSeries(object):
 #                 shared_size=self.data.dtype.itemsize*7*each_stream,
 #                 )
             func( self.data_gpu[counter], inputarray, self.op_gpu[counter],
-                grid=(gridsize, 1),
-                 block=(each_stream/gridsize, 1, 1),
+                grid=(1, 1),
+                 block=(each_stream/eachblock_blksz, 1, 1),
                  stream=streams[counter],
-                 shared=self.data.dtype.itemsize*7*each_stream,
+                 shared=self.data.dtype.itemsize*7*each_stream/eachblock_blksz,
                  )
             
             #self.output[each_stream*counter:each_stream*(counter+1)] = cuda.from_device_like( self.op_gpu, holder, stream)
-#        for counter in range(batches):
+        for counter in range(batches):
             cuda.memcpy_dtoh_async(
                 self.output[each_stream*counter:each_stream*(counter+1)],
                 self.op_gpu[counter],
