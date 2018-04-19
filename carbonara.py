@@ -3,8 +3,10 @@
 
 import six
 import time
+import math
 import numpy
 import re
+import random
 import struct
 import pycuda.driver as cuda
 import pycuda.autoinit
@@ -34,6 +36,53 @@ def datetime64_to_epoch(dt):
 def round_timestamp(ts, freq):
     return UNIX_UNIVERSAL_START64 + numpy.floor(
         (ts - UNIX_UNIVERSAL_START64) / freq) * freq
+
+
+
+krnl_round_timestamps = SourceModule("""
+            #include "math_functions.h"
+            __global__ void round_timestamp(unsigned long long *a, unsigned long long freq) {{
+              int col;
+              unsigned long long UNIX_UNIVERSAL_START64={UNIX_UNIVERSAL_START64};
+              col = blockIdx.x * blockDim.x + threadIdx.x;
+              a[col] = (UNIX_UNIVERSAL_START64 + ((a[col] - UNIX_UNIVERSAL_START64) / freq) * freq);
+              }}
+            """.format(UNIX_UNIVERSAL_START64=numpy.int64(UNIX_UNIVERSAL_START64)),
+                        options=['--generate-line-info'],
+                        keep=True).get_function('round_timestamp')
+
+
+def gpuround_timestamp(ts, freq):
+    gpu_in = cuda.to_device(numpy.ascontiguousarray(ts.view('uint64')))
+    krnl_round_timestamps(gpu_in, numpy.int64(freq*1e9), block=(1024,1,1), grid=(ts.size//1024,1))
+    dt = cuda.from_device(gpu_in, ts.size, 'uint64')
+    return dt
+
+
+
+
+krnl_gpu_sum = SourceModule("""
+        __global__ void gpu_sum(float *a, float *op, int perthread) {
+          int col, index, counter;
+          extern __shared__ float inter[];
+          col = blockIdx.x * blockDim.x + threadIdx.x;
+          int tid = threadIdx.x;
+          #pragma unroll
+          for(counter=0;counter<perthread;counter++){
+              index = col + blockDim.x*counter;
+              inter[blockDim.x * counter + tid] = a[index];
+          }
+
+          __syncthreads();
+          int x = 0;
+          #pragma unroll
+          for(counter=0;counter<perthread;counter++){
+              x += inter[perthread*tid + counter];
+          }
+          op[col] = x;
+        }
+        """, options=['--generate-line-info'], keep=True).get_function("gpu_sum")
+
 
 
 def make_timeseries(timestamps, values):
@@ -95,8 +144,9 @@ class AggregatedTimeSerie(TimeSerie):
         self.aggregation_method = aggregation_method
 
     def resample(self, sampling):
+        usegpu = True if self.aggregation_method.startswith('gpu_') else False
         return AggregatedTimeSerie.from_grouped_serie(
-            self.group_serie(sampling), sampling, self.aggregation_method)
+            self.group_serie(sampling, usegpu=usegpu), sampling, self.aggregation_method)
 
     @classmethod
     def from_data(cls, sampling, aggregation_method, timestamps,
@@ -125,14 +175,14 @@ class AggregatedTimeSerie(TimeSerie):
                    ts=cls._resample_grouped(grouped_serie, agg_name,
                                             q))
 
-    def group_serie(self, granularity, start=None):
+    def group_serie(self, granularity, start=None, usegpu=False):
         # NOTE(jd) Our whole serialization system is based on Epoch, and we
         # store unsigned integer, so we can't store anything before Epoch.
         # Sorry!
         if len(self.ts) != 0 and self.first < UNIX_UNIVERSAL_START64:
             raise BeforeEpochError(self.first)
 
-        return GroupedGpuBasedTimeSeries(self.ts, granularity, start)
+        return GroupedGpuBasedTimeSeries(self.ts, granularity, start, usegpu=usegpu)
 
     @staticmethod
     def _resample_grouped(grouped_serie, agg_name, q=None):
@@ -157,7 +207,6 @@ class AggregatedTimeSerie(TimeSerie):
 
         for title, values in [
                 ("Simple continuous range", six.moves.range(points)),
-                #("Simple continuous range", [0] * (points)),
         ]:
             def per_sec(t1, t0):
                 return 1 / ((t1 - t0) / serialize_times)
@@ -167,8 +216,10 @@ class AggregatedTimeSerie(TimeSerie):
             ts = cls.from_data(sampling, 'mean', timestamps, values)
             pts = ts.ts.copy()
 
-            for agg in ['cpu_sum', 'gpu_sum']:
+            for agg in ['gpu_sum', 'cpu_sum']:
             #for agg in ['sum']:
+                if agg.startswith('gpu_'):
+                    cuda.start_profiler()
                 serialize_times = 3 if agg.endswith('pct') else 1
                 ts = cls(ts=pts, sampling=sampling,
                          aggregation_method=agg)
@@ -176,12 +227,14 @@ class AggregatedTimeSerie(TimeSerie):
                 for i in six.moves.range(serialize_times):
                     ts.resample(resample)
                 t1 = time.time()
-                print("  resample(%s) speed: %.2f Hz"
-                      % (agg, per_sec(t1, t0)))
+                if agg.startswith('gpu_'):
+                    cuda.stop_profiler()
+                print("  resample(%s) speed: %.2f Hz, time: %.5f msec"
+                      % (agg, per_sec(t1, t0), 1000*(t1-t0)/serialize_times))
 
 
 class GroupedGpuBasedTimeSeries(object):
-    def __init__(self, ts, granularity, start=None):
+    def __init__(self, ts, granularity, start=None, usegpu=False):
         # NOTE(sileht): The whole class assumes ts is ordered and don't have
         # duplicate timestamps, it uses numpy.unique that sorted list, but
         # we always assume the orderd to be the same as the input.
@@ -197,57 +250,40 @@ class GroupedGpuBasedTimeSeries(object):
                 numpy.searchsorted(ts['timestamps'], start_derive):
             ]
 
-        self.indexes = round_timestamp(self._ts['timestamps'], granularity)
-        self.tstamps, self.counts = numpy.unique(self.indexes,
-                                                 return_counts=True)
+        if usegpu:
+            ret = gpuround_timestamp(self._ts['timestamps'], granularity)
+            self.indexes = ret.view(dtype="datetime64[ns]")
+        else:
+            self.indexes = round_timestamp(self._ts['timestamps'], granularity)
+
         self.a = self._ts['values']
         self.a = self.a.copy(order='C').astype(numpy.float32)
         self.junk = cuda.mem_alloc(self.a.dtype.itemsize)
         self.reduce_by = int(self.granularity / numpy.timedelta64(5, 's'))
 
+        #self.in_gpu = cuda.pagelocked_empty(self.a.nbytes, numpy.float32, "C")
+        self.in_gpu = cuda.mem_alloc(self.a.nbytes)
+        cuda.memcpy_htod_async(self.in_gpu, self.a)
+        self.ret_gpu = cuda.mem_alloc(int(self.a.size* self.a.dtype.itemsize / self.reduce_by))
+        self.tstamps, self.counts = numpy.unique(self.indexes,
+                                                 return_counts=True)
+
+
     def gpu_sum(self):
-        tpl = Template("""
-                __global__ void v3(float *a, float *op) {
-                  int perthread= {{ perthread }};
-                  int col, index, counter;
-                  extern __shared__ float inter[];
-                  col = blockIdx.x * blockDim.x + threadIdx.x;
-                  int tid = threadIdx.x;
-                  #pragma unroll
-                  for(counter=0;counter<perthread;counter++){
-                      index = col + blockDim.x*counter;
-                      inter[blockDim.x * counter + tid] = a[index];
-                  }
-
-                  __syncthreads();
-                  int x = 0;
-                  #pragma unroll
-                  for(counter=0;counter<perthread;counter++){
-                      x += inter[perthread*tid + counter];
-                  }
-                  op[col] = x;
-                }
-                """)
-        ren_tpl = tpl.render(perthread=self.reduce_by)
-        summod = SourceModule(ren_tpl, options=['--generate-line-info'], keep=True)
-
-        func = summod.get_function("v3")
         t0 = time.time()
-        cuda.start_profiler()
-        in_gpu = cuda.mem_alloc(self.a.size * self.a.dtype.itemsize)
-        cuda.memcpy_htod(in_gpu, self.a)
-        ret_gpu = cuda.mem_alloc(int(self.a.size* self.a.dtype.itemsize / self.reduce_by))
+#        in_gpu = cuda.mem_alloc(self.a.size * self.a.dtype.itemsize)
+#        cuda.memcpy_htod(in_gpu, self.a)
+#        ret_gpu = cuda.mem_alloc(int(self.a.size* self.a.dtype.itemsize / self.reduce_by))
         gridsize = 1024
-        func(in_gpu, ret_gpu,
+        krnl_gpu_sum(self.in_gpu, self.ret_gpu, numpy.int32(self.reduce_by),
                 block=(1024, 1, 1), grid=(gridsize, 1),
                 shared=1024*self.reduce_by*self.a.dtype.itemsize
                 )
         ret = numpy.empty(self.a.size / self.reduce_by, numpy.float32)
-        cuda.memcpy_dtoh(ret, ret_gpu)
+        cuda.memcpy_dtoh(ret, self.ret_gpu)
         dat = make_timeseries(self.tstamps, ret)
-        cuda.stop_profiler()
         t1 = time.time()
-        print("gpu %0.7f" % (1000*(t1-t0)))
+        print("  time to aggregate  %0.7f msec" % (1000*(t1-t0)))
         return dat
 
     def cpu_sum(self):
@@ -256,6 +292,6 @@ class GroupedGpuBasedTimeSeries(object):
             numpy.repeat(numpy.arange(self.counts.size), self.counts),
             weights=self._ts['values']))
         t1 = time.time()
-        print("cpu %0.7f" % (1000*(t1-t0)))
+        print("  time to aggregate  %0.7f msec" % (1000*(t1-t0)))
         return dat
 AggregatedTimeSerie.benchmark()
