@@ -328,4 +328,28 @@ class GroupedGpuBasedTimeSeries(object):
         t1 = time.time()
         print("  time to aggregate  %0.7f msec" % (1000*(t1-t0)))
         return dat
+
+#POINTS_PER_SPLIT = 3600
+#points = POINTS_PER_SPLIT * 1000
+#points = 2 * 1024 * 6
+#points = 512*1024*6
+#points = 1024*1024*6
+#points = int(points)
+#sampling = numpy.timedelta64(5, 's')
+#resample = numpy.timedelta64(30, 's')
+#
+#now = numpy.datetime64("2015-04-03 23:11")
+#timestamps = numpy.sort(numpy.array( [now + i * sampling for i in six.moves.range(points)]))
+#a  = numpy.array(six.moves.range(points), dtype=numpy.float32, order="C")
+#cuda.start_profiler()
+#in_gpu = cuda.mem_alloc(a.nbytes)
+#cuda.memcpy_htod_async(in_gpu, a, stream=cuda.Stream())
+#ret_gpu = cuda.mem_alloc(a.nbytes)
+#rounded = gpuround_timestamp(timestamps.astype('datetime64[ns]'), resample)
+#d_counts = cuda.mem_alloc_like(rounded)
+#krnl_uniques(cuda.In(rounded), in_gpu, ret_gpu, block=(1024,1,1), grid=(1024*6,1))
+#ret = cuda.from_device(ret_gpu, a.size, numpy.float32)
+#cuda.stop_profiler()
+#print rounded
+#print ret
 AggregatedTimeSerie.benchmark()
