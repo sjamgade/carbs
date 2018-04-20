@@ -38,6 +38,47 @@ def round_timestamp(ts, freq):
         (ts - UNIX_UNIVERSAL_START64) / freq) * freq
 
 
+krnl_uniques = SourceModule("""
+                __global__ void count_uniqs(unsigned long long *a,
+                                            float *in,
+                                            float *op) {
+                  int col, count, should, sum;
+                  unsigned long long here;
+
+                  col = blockIdx.x * blockDim.x + threadIdx.x;
+                  int index = col;
+                  count = 0;
+                  sum = 0;
+                  here = a[index];
+                  //extern __shared__ float inter[];
+                  //inter[threadIdx] = in[col];
+                  if (col > 0){
+                      if (here != a[col-1]){
+                          sum = in[col];
+                          should = 1;
+                          //atomicAdd(&unques, 1);
+                      }
+                      else { should = 0; }
+                   }
+                   else {
+                       should=1;
+                   }
+                   __syncthreads();
+
+                  if (should) {
+                      count=1;
+                      col++;
+                      while (here == a[col]){
+                          sum += in[col];
+                          count++;
+                          col++;
+                          if (col >= gridDim.x * blockDim.x)
+                            break;
+                      }
+                      op[index] = sum;
+                  }
+                }
+                """).get_function('count_uniqs')
 
 krnl_round_timestamps = SourceModule("""
             #include "math_functions.h"
@@ -256,35 +297,28 @@ class GroupedGpuBasedTimeSeries(object):
         else:
             self.indexes = round_timestamp(self._ts['timestamps'], granularity)
 
-        self.a = self._ts['values']
-        self.a = self.a.copy(order='C').astype(numpy.float32)
-        self.junk = cuda.mem_alloc(self.a.dtype.itemsize)
-        self.reduce_by = int(self.granularity / numpy.timedelta64(5, 's'))
-
-        #self.in_gpu = cuda.pagelocked_empty(self.a.nbytes, numpy.float32, "C")
-        self.in_gpu = cuda.mem_alloc(self.a.nbytes)
-        cuda.memcpy_htod_async(self.in_gpu, self.a)
-        self.ret_gpu = cuda.mem_alloc(int(self.a.size* self.a.dtype.itemsize / self.reduce_by))
+        if usegpu:
+            self.a = self._ts['values']
+            self.a = self.a.copy(order='C').astype(numpy.float32)
+            self.in_gpu = cuda.mem_alloc(self.a.nbytes)
+            cuda.memcpy_htod_async(self.in_gpu, self.a)
+            self.ret_gpu = cuda.mem_alloc(self.a.nbytes)
+            krnl_uniques(cuda.In(self.indexes.view(dtype='uint64')),
+                    self.in_gpu,
+                    self.ret_gpu,
+                    block=(1024,1,1),
+                    grid=(1024*6,1))
+        t0 = time.time()
         self.tstamps, self.counts = numpy.unique(self.indexes,
                                                  return_counts=True)
+        t1 = time.time()
+        print("uniques %0.7f" % (1000*(t1-t0)))
 
 
     def gpu_sum(self):
-        t0 = time.time()
-#        in_gpu = cuda.mem_alloc(self.a.size * self.a.dtype.itemsize)
-#        cuda.memcpy_htod(in_gpu, self.a)
-#        ret_gpu = cuda.mem_alloc(int(self.a.size* self.a.dtype.itemsize / self.reduce_by))
-        gridsize = 1024
-        krnl_gpu_sum(self.in_gpu, self.ret_gpu, numpy.int32(self.reduce_by),
-                block=(1024, 1, 1), grid=(gridsize, 1),
-                shared=1024*self.reduce_by*self.a.dtype.itemsize
-                )
-        ret = numpy.empty(self.a.size / self.reduce_by, numpy.float32)
-        cuda.memcpy_dtoh(ret, self.ret_gpu)
-        dat = make_timeseries(self.tstamps, ret)
-        t1 = time.time()
-        print("  time to aggregate  %0.7f msec" % (1000*(t1-t0)))
-        return dat
+        ret = cuda.from_device(self.ret_gpu, self.a.size, numpy.float32)
+        del self.ret_gpu
+        return ret
 
     def cpu_sum(self):
         t0 = time.time()
