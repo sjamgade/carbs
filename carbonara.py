@@ -39,6 +39,7 @@ def round_timestamp(ts, freq):
 
 krnl_uniques = SourceModule("""
                 __global__ void count_uniqs(unsigned long long *a,
+                                            int *uniqs,
                                             float *in,
                                             float *op) {
                   int col, count, should, sum;
@@ -74,6 +75,7 @@ krnl_uniques = SourceModule("""
                       }
                   }
                   op[index] = sum;
+                  uniqs[index] = count;
                 }
                 """).get_function('count_uniqs')
 
@@ -301,12 +303,12 @@ class GroupedGpuBasedTimeSeries(object):
             cuda.memcpy_htod_async(self.in_gpu, self.a)
             #self.indexes = ret.view(dtype="datetime64[ns]")
 
-            
+            self.uniqs_gpu = cuda.mem_alloc(self.a.size * numpy.dtype('int32').itemsize)
             self.sum_gpu = cuda.mem_alloc(self.a.nbytes)
             self.streams['tstamps'] = cuda.Stream()
             #krnl_uniques(cuda.In(self.indexes.view('uint64')),
             krnl_uniques(self.indexes,
-            
+                            self.uniqs_gpu,
                             self.in_gpu,
                             self.sum_gpu,
                             block=(1024,1,1),
@@ -316,13 +318,13 @@ class GroupedGpuBasedTimeSeries(object):
             
             self.tcounts = numpy.empty_like(self.a, dtype='int32')
             self.sum_done = numpy.empty_like(self.a, dtype='float32')
-           
-          
+            cuda.memcpy_dtoh_async(self.tcounts, self.uniqs_gpu, stream=self.streams['tstamps'])
+            #cuda.memcpy_dtoh(self.tcounts, self.uniqs_gpu)
             cuda.memcpy_dtoh_async(self.sum_done, self.sum_gpu, stream=self.streams['tstamps'])
             #cuda.memcpy_dtoh(self.sum_done, self.sum_gpu)
             t1 = time.time()
             print("gpu uniques t1 %0.7f" % (1000*(t1-t0)))
-            
+            #self.debuguniques()
 
         else:
             t0 = time.time()
@@ -335,8 +337,8 @@ class GroupedGpuBasedTimeSeries(object):
     def gpu_sum(self):
         del self.sum_gpu
         self.streams['tstamps'].synchronize()
-        
-        
+        self.counts = self.tcounts[self.tcounts > 0]
+        self.tstamps = self._ts['timestamps'][self.tcounts >0 ]
         return self.sum_done
 
     def cpu_sum(self):
@@ -347,6 +349,27 @@ class GroupedGpuBasedTimeSeries(object):
         t1 = time.time()
         print("  time to aggregate  %0.7f msec" % (1000*(t1-t0)))
         return dat
+
+
+    def debuguniques(self):
+        self.indexes_c = round_timestamp(self._ts['timestamps'], granularity)
+        t0 = time.time()
+        self.tstamps_c, self.counts_c = numpy.unique(self.indexes,
+                                                 return_counts=True)
+        t1 = time.time()
+        print("uniques %0.7f" % (1000*(t1-t0)))
+                
+        try:
+            assert all(self.tstamps_c == self.tstamps)
+        except:
+            ret = cuda.from_device(self.sum_gpu, self.a.size, numpy.float32)
+            import pdb;pdb.set_trace()
+        try:
+            assert all(self.counts_c == self.counts)
+        except:
+            ret = cuda.from_device(self.sum_gpu, self.a.size, numpy.float32)
+            import pdb;pdb.set_trace()
+
 
 #POINTS_PER_SPLIT = 3600
 #points = POINTS_PER_SPLIT * 1000
