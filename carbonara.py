@@ -12,7 +12,6 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 from pycuda.compiler import SourceModule
 
-from jinja2 import Template
 
 #cuda.initialize_profiler()
 
@@ -50,8 +49,6 @@ krnl_uniques = SourceModule("""
                   count = 0;
                   sum = 0;
                   here = a[index];
-                  //extern __shared__ float inter[];
-                  //inter[threadIdx] = in[col];
                   if (col > 0){
                       if (here != a[col-1]){
                           sum = in[col];
@@ -63,7 +60,7 @@ krnl_uniques = SourceModule("""
                    else {
                        should=1;
                    }
-                   __syncthreads();
+                   //__syncthreads();
 
                   if (should) {
                       count=1;
@@ -75,8 +72,8 @@ krnl_uniques = SourceModule("""
                           if (col >= gridDim.x * blockDim.x)
                             break;
                       }
-                      op[index] = sum;
                   }
+                  op[index] = sum;
                 }
                 """).get_function('count_uniqs')
 
@@ -93,10 +90,18 @@ krnl_round_timestamps = SourceModule("""
                         keep=True).get_function('round_timestamp')
 
 
-def gpuround_timestamp(ts, freq):
-    gpu_in = cuda.to_device(numpy.ascontiguousarray(ts.view('uint64')))
-    krnl_round_timestamps(gpu_in, numpy.int64(freq*1e9), block=(1024,1,1), grid=(ts.size//1024,1))
-    dt = cuda.from_device(gpu_in, ts.size, 'uint64')
+def gpuround_timestamp(ts, freq, dev_ptr=True):
+    strm = stream=cuda.Stream()
+    gpu_in = cuda.mem_alloc(ts.nbytes)
+    cuda.memcpy_htod_async(gpu_in, numpy.ascontiguousarray(ts.view('uint64')), stream=strm)
+    krnl_round_timestamps(gpu_in, numpy.int64(freq*1e9),
+                            block=(1024,1,1),
+                            grid=(ts.size//1024,1),
+                            stream=strm)
+    if dev_ptr:
+        dt = gpu_in
+    else:
+        dt = cuda.from_device(gpu_in, ts.size, 'uint64', strm)
     return dt
 
 
@@ -234,14 +239,10 @@ class AggregatedTimeSerie(TimeSerie):
     def benchmark(cls):
         """Run a speed benchmark!"""
 
-        POINTS_PER_SPLIT = 3600
-        points = POINTS_PER_SPLIT * 1000
-        points = 2 * 1024 * 6
-        points = 512*1024*6
-        points = 1024*1024*6
+        points = 32*1024
         points = int(points)
         sampling = numpy.timedelta64(5, 's')
-        resample = numpy.timedelta64(30, 's')
+        resample = numpy.timedelta64(50, 's')
 
         now = numpy.datetime64("2015-04-03 23:11")
         timestamps = numpy.sort(numpy.array( [now + i * sampling for i in six.moves.range(points)]))
@@ -258,7 +259,6 @@ class AggregatedTimeSerie(TimeSerie):
             pts = ts.ts.copy()
 
             for agg in ['gpu_sum', 'cpu_sum']:
-            #for agg in ['sum']:
                 if agg.startswith('gpu_'):
                     cuda.start_profiler()
                 serialize_times = 3 if agg.endswith('pct') else 1
@@ -270,7 +270,7 @@ class AggregatedTimeSerie(TimeSerie):
                 t1 = time.time()
                 if agg.startswith('gpu_'):
                     cuda.stop_profiler()
-                print("  resample(%s) speed: %.2f Hz, time: %.5f msec"
+                print("resample(%s) speed: %.2f Hz, time: %.5f msec"
                       % (agg, per_sec(t1, t0), 1000*(t1-t0)/serialize_times))
 
 
@@ -281,10 +281,12 @@ class GroupedGpuBasedTimeSeries(object):
         # we always assume the orderd to be the same as the input.
         self.granularity = granularity
         self.start = start
+        self.streams = {}
         if start is None:
             self._ts = ts
             self._ts_for_derive = ts
         else:
+            # this else is never traversed
             self._ts = ts[numpy.searchsorted(ts['timestamps'], start):]
             start_derive = start - granularity
             self._ts_for_derive = ts[
@@ -292,33 +294,50 @@ class GroupedGpuBasedTimeSeries(object):
             ]
 
         if usegpu:
-            ret = gpuround_timestamp(self._ts['timestamps'], granularity)
-            self.indexes = ret.view(dtype="datetime64[ns]")
-        else:
-            self.indexes = round_timestamp(self._ts['timestamps'], granularity)
-
-        if usegpu:
-            self.a = self._ts['values']
-            self.a = self.a.copy(order='C').astype(numpy.float32)
+            t0 = time.time()
+            self.indexes = gpuround_timestamp(self._ts['timestamps'], granularity, True)
+            self.a = self._ts['values'].astype(numpy.float32, order="C")
             self.in_gpu = cuda.mem_alloc(self.a.nbytes)
             cuda.memcpy_htod_async(self.in_gpu, self.a)
-            self.ret_gpu = cuda.mem_alloc(self.a.nbytes)
-            krnl_uniques(cuda.In(self.indexes.view(dtype='uint64')),
-                    self.in_gpu,
-                    self.ret_gpu,
-                    block=(1024,1,1),
-                    grid=(1024*6,1))
-        t0 = time.time()
-        self.tstamps, self.counts = numpy.unique(self.indexes,
-                                                 return_counts=True)
-        t1 = time.time()
-        print("uniques %0.7f" % (1000*(t1-t0)))
+            #self.indexes = ret.view(dtype="datetime64[ns]")
 
+            
+            self.sum_gpu = cuda.mem_alloc(self.a.nbytes)
+            self.streams['tstamps'] = cuda.Stream()
+            #krnl_uniques(cuda.In(self.indexes.view('uint64')),
+            krnl_uniques(self.indexes,
+            
+                            self.in_gpu,
+                            self.sum_gpu,
+                            block=(1024,1,1),
+                            grid=(self.a.size//1024,1),
+                            stream=self.streams['tstamps'])
+
+            
+            self.tcounts = numpy.empty_like(self.a, dtype='int32')
+            self.sum_done = numpy.empty_like(self.a, dtype='float32')
+           
+          
+            cuda.memcpy_dtoh_async(self.sum_done, self.sum_gpu, stream=self.streams['tstamps'])
+            #cuda.memcpy_dtoh(self.sum_done, self.sum_gpu)
+            t1 = time.time()
+            print("gpu uniques t1 %0.7f" % (1000*(t1-t0)))
+            
+
+        else:
+            t0 = time.time()
+            self.indexes = round_timestamp(self._ts['timestamps'], granularity)
+            self.tstamps, self.counts = numpy.unique(self.indexes, return_counts=True)
+            t1 = time.time()
+            print("uniques %0.7f" % (1000*(t1-t0)))
+                    
 
     def gpu_sum(self):
-        ret = cuda.from_device(self.ret_gpu, self.a.size, numpy.float32)
-        del self.ret_gpu
-        return ret
+        del self.sum_gpu
+        self.streams['tstamps'].synchronize()
+        
+        
+        return self.sum_done
 
     def cpu_sum(self):
         t0 = time.time()
@@ -344,11 +363,11 @@ class GroupedGpuBasedTimeSeries(object):
 #cuda.start_profiler()
 #in_gpu = cuda.mem_alloc(a.nbytes)
 #cuda.memcpy_htod_async(in_gpu, a, stream=cuda.Stream())
-#ret_gpu = cuda.mem_alloc(a.nbytes)
+#sum_gpu = cuda.mem_alloc(a.nbytes)
 #rounded = gpuround_timestamp(timestamps.astype('datetime64[ns]'), resample)
-#d_counts = cuda.mem_alloc_like(rounded)
-#krnl_uniques(cuda.In(rounded), in_gpu, ret_gpu, block=(1024,1,1), grid=(1024*6,1))
-#ret = cuda.from_device(ret_gpu, a.size, numpy.float32)
+#d_counts = cuda.mem_alloc(a.size * numpy.dtype('int32').itemsize)
+#krnl_uniques(cuda.In(rounded), d_counts, in_gpu, sum_gpu, block=(1024,1,1), grid=(1024*6,1))
+#ret = cuda.from_device(sum_gpu, a.size, numpy.float32)
 #cuda.stop_profiler()
 #print rounded
 #print ret
