@@ -165,7 +165,7 @@ class AggregatedTimeSerie(TimeSerie):
             ts = cls.from_data(sampling, 'mean', timestamps, values)
             pts = ts.ts.copy()
 
-            for agg in ['cpu_sum', 'gpu_sum']:
+            for agg in ['gpu_sum', 'cpu_sum' ]:
             #for agg in ['sum']:
                 serialize_times = 3 if agg.endswith('pct') else 1
                 ts = cls(ts=pts, sampling=sampling,
@@ -299,7 +299,7 @@ class GroupedGpuBasedTimeSeries(object):
             }
             """, options=['--generate-line-info'], keep=True)
 
-        #t0 = time.time()
+        t0 = time.time()
         func = summod.get_function("v4")
         eachblock_blksz = 128
         each_stream = 1024 * 128
@@ -357,16 +357,16 @@ class GroupedGpuBasedTimeSeries(object):
             #cuda.memcpy_dtoh(self.output, self.op_gpu)
         [strm.synchronize() for strm in streams]
         cuda.stop_profiler()
-        #t1 = time.time()
-        #print("%0.7f" % (t1-t0))
+        t1 = time.time()
+        print("  time to aggregate %0.7f msec" % (1000*(t1-t0)))
         return 
 
     def cpu_sum(self):
-        #t0 = time.time()
+        t0 = time.time()
         dat = make_timeseries(self.tstamps, numpy.bincount(
             numpy.repeat(numpy.arange(self.counts.size), self.counts),
             weights=self._ts['values']))
-        #t1 = time.time()
-        #print("%0.7f" % (t1-t0))
+        t1 = time.time()
+        print("  time to aggregate %0.7f msec" % (1000*(t1-t0)))
         return dat
 AggregatedTimeSerie.benchmark()
