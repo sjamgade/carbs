@@ -200,7 +200,7 @@ class AggregatedTimeSerie(TimeSerie):
 
         for title, values in [
                 ("Simple continuous range", six.moves.range(points)),
-                ("Simple continuous range", [0] * (points)),
+                ("Just zeros", [0] * (points)),
         ]:
             def per_sec(t1, t0):
                 return 1 / ((t1 - t0) / serialize_times)
@@ -210,16 +210,16 @@ class AggregatedTimeSerie(TimeSerie):
             ts = cls.from_data(sampling, 'mean', timestamps, values)
             pts = ts.ts.copy()
 
-            for agg in ['sum', 'inhere']:
-                serialize_times = 10
+            for agg in ['gpu_sum', 'cpu_sum']:
+                serialize_times = 1
                 ts = cls(ts=pts, sampling=sampling,
                          aggregation_method=agg)
                 t0 = time.time()
                 for i in six.moves.range(serialize_times):
                     ts.resample(resample)
                 t1 = time.time()
-                print("  resample(%s) speed: %.2f Hz"
-                      % (agg, per_sec(t1, t0)))
+                print("  resample(%s) speed: %.2f Hz; %s msec"
+                      % (agg, per_sec(t1, t0), (1000*(t1-t0))))
 
 
 class GroupedTimeSeries(object):
@@ -246,7 +246,7 @@ class GroupedTimeSeries(object):
         self.a = self.a.copy(order='C').astype(numpy.float32)
         self.a_gpu = cuda.mem_alloc(self.a.size * self.a.dtype.itemsize)
 
-    def sum(self):
+    def gpu_sum(self):
         summod = SourceModule("""
             __global__ void v1(float *a, int *i) {
               int perthread=i[0];
@@ -278,40 +278,29 @@ class GroupedTimeSeries(object):
 
             """)
 
-#        a = numpy.random.randn(4, 4)
-#        self.a = a.astype(numpy.float32)
-#        self.a = self.a.copy(order='C').astype(numpy.float32)
-#        self.a_gpu = cuda.mem_alloc(self.a.size * self.a.dtype.itemsize)
-#        t0 = time.time()
+
+        t0 = time.time()
         cuda.memcpy_htod(self.a_gpu, self.a)
-        func = summod.get_function("v1")
-        func(self.a_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1), grid=(1024, 1))
+
+        # uncomment for v1
+        # func = summod.get_function("v1")
+        # func(self.a_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1), grid=(1024, 1))
+
+        func = summod.get_function("v2")
+        func(self.a_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1))
+
         a_doubled = numpy.empty_like(self.a)
         cuda.memcpy_dtoh(a_doubled, self.a_gpu)
-#        t1 = time.time()
-#        print("%0.7f, %s" % (t1-t0, numpy.all(a_doubled == 0)))
-#        print numpy.all(a_doubled == 0) 
+        t1 = time.time()
 
-#        t0 = time.time()
-#        cuda.memcpy_htod(self.a_gpu, self.a)
-#        func = summod.get_function("v2")
-#        func(self.a_gpu, cuda.In(numpy.array([6])), block=(1024, 1, 1))
-#        a_doubled = numpy.empty_like(self.a)
-#        cuda.memcpy_dtoh(a_doubled, self.a_gpu)
-#        t1 = time.time()
-#        print("%0.7f, %s" % (t1-t0, numpy.all(a_doubled == 0)))
+        print("  time to aggregate %0.7f msec" % ((t1-t0)*1000))
 
-#        print "original array:"
-#        print self.a
-#        print "doubled with kernel:"
-       #a_gpu.free()
-
-    def inhere(self):
+    def cpu_sum(self):
         t0 = time.time()
         dat = make_timeseries(self.tstamps, numpy.bincount(
             numpy.repeat(numpy.arange(self.counts.size), self.counts),
             weights=self._ts['values']))
         t1 = time.time()
-        print("%0.7f" % (t1-t0))
+        print("  time to aggregate %0.7f msec" % ((t1-t0)*1000))
         return dat
 AggregatedTimeSerie.benchmark()
