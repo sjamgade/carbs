@@ -1,16 +1,17 @@
 
 ### Background (Why):
 
-Anyone who knows Openstack is aware of its component Ceilometer (Telemetry). Ceilometer was huge, its main purpose was to help with Monitoring and Metering of whole of OpenStack. But because of the scale at which OpenStack operates, Ceilometer would often fall behind and become a major bottleneck for the same function it was designed to do. It had one more problem, of aggregating these metrics and providing them in a more consumable format.
+Anyone who knows Openstack is aware of its component Ceilometer (Telemetry). Ceilometer was huge, its main purpose was to help with the Monitoring and Metering of whole of th OpenStack. But because of the scale at which OpenStack operates, Ceilometer would often fall behind and become a major bottleneck for the same function it was designed to do. It had one more problem:- of aggregating these metrics and providing them in a more consumable format.
  
-So it was broken into different parts and this gave rise to a time series database - [Gnocchi.](https://github.com/gnocchixyz/gnocchi/)
+So it was broken into different parts and this gave rise to a time series database - [Gnocchi.](https://github.com/gnocchixyz/gnocchi/). Gnocchi stores data directly on the disk in its custom format. And then using a group of processes on same node. If the storage disk is shared across different nodes then Gnocchi can form a cluster of processes from these nodes to aggregate the data. The received data is referred as metrics, as it the measured usage of the various resources(like cpu, ram, disk, network) in OpenStack.
  
-One of the ways Gnocchi is different is the way it handles aggregation. Instead of processing the metrics to generate aggregates whenever and however they are asked for, it makes admin/user commit on what kind of aggregations need to be done before defining the metrics  and calculates and stores these aggregates as soon as it is received.
+One of the ways Gnocchi is different is the way it handles aggregation. Instead of processing the metrics to generate aggregates (sum,mean,std-deviation etc) whenever and however they are asked for, it makes the user choose on what kind of aggregations need to be done before defining the metrics and calculates and stores the metrics and aggregates immediately.
  
-So the admin/user has to tell Gnocchi that the metrics *X* will be received at *A* intervals but should be also aggregated to *B* intervals in *Y* ways and archive the data after *N* time.  For example: 
-Receive the *cpu-usage-vm* at every *5* sec interval and generate *sum,mean,std-deviation...* for *1m, 10m, 30m, 1h, 12h, 24h, 7d, 15d, 30d* and delete after *30days*.
+So the user has to tell Gnocchi that the metrics *X* will be received at interval *A* but should be also aggregated to interval *B* to make *Y* aggregates and then data should be archived after *N* time. 
+For example: 
+Receive *cpu-usage-vm* every *5* sec and generate *sum,mean,std-deviation* for *1m, 10m, 30m, 1h, 12h, 24h, 7d, 15d, 30d*, delete after *30days*.
  
-As the received data is immediately aggregated and stored, retrieval is as good as a single disk read. Ofcourse since Gnocchi writes data directly to disk it has its own file storage format. In a way the aggregation problem is never faced and therefore never needed to be solved.  But this pre-computing was still a problem as the amount of data could get really overwhelming and Gnocchi tries to solve this problem by letting a large number of worker aggregate the data forming a cluster over distributed nodes.
+As the received data are immediately aggregated and stored, retrieval is as good as a single disk read. In a way the aggregation problem (as faced by ceilometer, as mentioned above) is never faced and therefore never needed to be solved.  But this pre-computing was still a problem as the amount of data could get really overwhelming and Gnocchi tries to solve this problem by letting a large number of worker aggregate the data forming a cluster over distributed nodes.
  
 However this peculiar way of restricting the problem space and pre-committing the range of values for the various of aggregations allowed some space for **Experiments**.
  
