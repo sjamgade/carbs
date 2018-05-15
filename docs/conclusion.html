@@ -1,0 +1,115 @@
+﻿<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>conclusion</title>
+  <link rel="stylesheet" href="https://stackedit.io/style.css" />
+</head>
+
+<body class="stackedit">
+  <div class="stackedit__html"><p>In <a href="https://sjamgade.github.io/carbs/profiling.html">Part 2</a>,  I summarized the iterations applied to the kernel (the piece of CUDA code that executes on GPU) to remove the bottlenecks encountered during profiling, like using shared memory to avoid non-coalesced memory access. In this part, I will talk about the final version of the kernel and using the GPU in other parts of the library.</p>
+<h4 id="v4">v4</h4>
+<p>Using streams to speed up the whole calculation I created <a href="https://github.com/sjamgade/carbs/blob/4d626a02704fcd5eb481785b5b3dbe743452f503/carbonara.py#L272">v4</a>. It divides up the work of copying data across streams and then fires compute kernels on GPU with appropriate arguments. There was some speed up and aggregation took <code>~4 msec or 4000 microsec</code> less than the that of <code>v3</code>.</p>
+<p>Code:</p>
+<pre class=" language-cpp"><code class="prism  language-cpp">            __global__ <span class="token keyword">void</span> <span class="token function">v4</span><span class="token punctuation">(</span><span class="token keyword">float</span> <span class="token operator">*</span>data<span class="token punctuation">,</span> <span class="token keyword">int</span> <span class="token operator">*</span>i<span class="token punctuation">,</span> <span class="token keyword">float</span> <span class="token operator">*</span>output<span class="token punctuation">)</span> <span class="token punctuation">{</span>
+              <span class="token keyword">int</span> perthread<span class="token operator">=</span><span class="token number">7</span><span class="token punctuation">;</span>
+              <span class="token keyword">int</span> blklimit<span class="token operator">=</span><span class="token number">128</span><span class="token punctuation">;</span>
+              <span class="token keyword">int</span> blk<span class="token operator">=</span><span class="token number">1</span><span class="token punctuation">;</span>
+              <span class="token keyword">int</span> row<span class="token punctuation">,</span> col<span class="token punctuation">,</span> index<span class="token punctuation">;</span>
+              <span class="token keyword">extern</span> __shared__ <span class="token keyword">float</span> inter<span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">;</span>
+              <span class="token keyword">int</span> counter <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+              <span class="token keyword">for</span> <span class="token punctuation">(</span>blk<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">;</span>blk<span class="token operator">&lt;</span>blklimit<span class="token punctuation">;</span>blk<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+                  counter <span class="token operator">=</span> perthread<span class="token number">-1</span><span class="token punctuation">;</span>
+                  col <span class="token operator">=</span> blockIdx<span class="token punctuation">.</span>x <span class="token operator">*</span> blockDim<span class="token punctuation">.</span>x <span class="token operator">+</span> threadIdx<span class="token punctuation">.</span>x <span class="token operator">+</span> blockDim<span class="token punctuation">.</span>x<span class="token operator">*</span>blk<span class="token operator">*</span>perthread<span class="token punctuation">;</span>
+                  row <span class="token operator">=</span> blockIdx<span class="token punctuation">.</span>y <span class="token operator">*</span> blockDim<span class="token punctuation">.</span>y <span class="token operator">+</span> threadIdx<span class="token punctuation">.</span>y<span class="token punctuation">;</span>
+                  <span class="token keyword">int</span> tid <span class="token operator">=</span> threadIdx<span class="token punctuation">.</span>x<span class="token punctuation">;</span>
+                  <span class="token keyword">for</span><span class="token punctuation">(</span>counter<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">;</span>counter<span class="token operator">&lt;</span>perthread<span class="token punctuation">;</span>counter<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+                      index <span class="token operator">=</span> col <span class="token operator">+</span> blockDim<span class="token punctuation">.</span>x<span class="token operator">*</span>counter <span class="token operator">+</span> row<span class="token punctuation">;</span>
+                      inter<span class="token punctuation">[</span>blockDim<span class="token punctuation">.</span>x <span class="token operator">*</span> counter <span class="token operator">+</span> tid<span class="token punctuation">]</span> <span class="token operator">=</span> data<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">;</span>
+                  <span class="token punctuation">}</span>
+                  <span class="token function">__syncthreads</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+                  <span class="token keyword">int</span> x <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>
+                  <span class="token keyword">for</span><span class="token punctuation">(</span>counter<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">;</span>counter<span class="token operator">&lt;</span>perthread<span class="token punctuation">;</span>counter<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>
+                      x <span class="token operator">+</span><span class="token operator">=</span> inter<span class="token punctuation">[</span>blockDim<span class="token punctuation">.</span>x <span class="token operator">*</span> counter <span class="token operator">+</span> tid<span class="token punctuation">]</span><span class="token punctuation">;</span>
+                  <span class="token punctuation">}</span>
+                  index <span class="token operator">=</span> col <span class="token operator">+</span> row<span class="token punctuation">;</span>
+                  output<span class="token punctuation">[</span>tid<span class="token punctuation">]</span> <span class="token operator">=</span> x<span class="token punctuation">;</span>
+                  <span class="token function">__syncthreads</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+                  
+              <span class="token punctuation">}</span>
+            <span class="token punctuation">}</span>
+</code></pre>
+<p>Result:</p>
+<pre><code>Simple continuous range
+  time to aggregate 10.4160309 msec
+  resample(gpu_sum) speed: 1.84 Hz
+  time to aggregate 79.3750286 msec
+  resample(cpu_sum) speed: 1.91 Hz
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/sjamgade/carbs/v4/2018-04-25-113103_1887x525_scrot.png" alt="Asynchronous copy and execution over Streams"></p>
+<pre><code>- Magenta Color               : API call from CPU  to GPU like memalloc, memcpy etc
+- Golden Color                : Memory copy(Memcpy)
+- Dark Cyan Color(v1,v2,v3,v4): Actual kernel execution (computation) on GPU
+- HtoD                        : CPU-RAM to GPU-RAM 
+- DtoH                        : GPU-RAM to CPU-RAM 
+- Sync                       : Blocking Call; CPU will wait till the GPU is Done
+</code></pre>
+<p>So instead of using <code>blk</code>s for dividing the data, I used streams and each block performed aggregations over only a part of the data. But from the timeline it was clear that there were still more optimizations possible. For example using a big <code>memalloc</code> as an array and share parts of it  across streams. This was already an improvement.</p>
+<p>But if one looked at the whole picture, the new versions were getting more complicated for no real benefit in performance.</p>
+<p>One way I looked at reducing the time required to <code>memcpy</code> was utilizing the bus between CPU and GPU. There is a possibility that the PCIe bus was underutilized and by launching <code>memcpy</code> from different threads this could be improved. However that was not the case, my CPU has a PCIe3 x16 bus and according to <a href="https://www.deskdecode.com/difference-between-pci-express-gen-1-gen-2-gen-3/">this link</a> it was capable of doing at least 16GB/s but the GPU (Quadro K620) has PCIe2 x16 bus thus limiting the <code>mempcy</code> speed.</p>
+<p>I made some more optimizations like that of compiling the kernel code at load time, assuming a real world scenario would (hopefully) not require rewriting the kernel. Later I removed the use of <code>jinja</code> as compiling those templates was as slow as 130 msec, even the kernel execution was faster than that.</p>
+<p>So leaving the code as it is I turned to other parts of the library which could be "Gpu"ed to gain benefits and for this I choose the <code>v3</code> kernel to begin with as that was simple and yet not too simple.</p>
+<h4 id="round_timestamps">round_timestamps</h4>
+<p><a href="https://github.com/sjamgade/carbs/commit/efd993d8ffb6ded2aa7d76171f428d6d4b648538">round_timestamps</a>  was the easiest of all because each thread could operate on individual data and there was no complicated math to be done. So each <code>numpy.datetime64[ns]</code> could be represented by an <code>unsigned long long</code> on the GPU and a floor operation was nothing but an integer division. The result is written over input array so <strong>no</strong> extra allocation was required. <a href="https://raw.githubusercontent.com/sjamgade/carbs/V3/round_timestamp.pdf">Perf analysis for round_timestamps</a></p>
+<pre class=" language-cpp"><code class="prism  language-cpp">     __global__ <span class="token keyword">void</span> <span class="token function">round_timestamp</span><span class="token punctuation">(</span><span class="token keyword">unsigned</span> <span class="token keyword">long</span> <span class="token keyword">long</span> <span class="token operator">*</span>a<span class="token punctuation">,</span> <span class="token keyword">unsigned</span> <span class="token keyword">long</span> <span class="token keyword">long</span> freq<span class="token punctuation">)</span> <span class="token punctuation">{</span>
+	    <span class="token keyword">int</span> col<span class="token punctuation">;</span>
+        <span class="token keyword">unsigned</span> <span class="token keyword">long</span> <span class="token keyword">long</span> UNIX_UNIVERSAL_START64<span class="token operator">=</span><span class="token punctuation">{</span>UNIX_UNIVERSAL_START64<span class="token punctuation">}</span><span class="token punctuation">;</span>
+        col <span class="token operator">=</span> blockIdx<span class="token punctuation">.</span>x <span class="token operator">*</span> blockDim<span class="token punctuation">.</span>x <span class="token operator">+</span> threadIdx<span class="token punctuation">.</span>x<span class="token punctuation">;</span>
+        a<span class="token punctuation">[</span>col<span class="token punctuation">]</span> <span class="token operator">=</span> <span class="token punctuation">(</span>UNIX_UNIVERSAL_START64 <span class="token operator">+</span> <span class="token punctuation">(</span><span class="token punctuation">(</span>a<span class="token punctuation">[</span>col<span class="token punctuation">]</span> <span class="token operator">-</span> UNIX_UNIVERSAL_START64<span class="token punctuation">)</span> <span class="token operator">/</span> freq<span class="token punctuation">)</span> <span class="token operator">*</span> freq<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/sjamgade/carbs/V3/2018-04-25-123214_1912x374_scrot.png" alt="Profiler timeline for round_timestamps"></p>
+<h4 id="count_uniqsdiff">count_uniqs(<a href="https://github.com/sjamgade/carbs/commit/4c3b16b1fb9da500365a8a77420deffe25d07372">diff</a>)</h4>
+<p>So far everything was fine and I still have a speed-up of 4×  with a naive implementation. But the kernel so far has been relying on one assumption of <code>resample-factor</code>. This <code>resample-factor</code> is what the code calls <code>reduce_by</code>. When aggregating sample spaced at 5s interval to 35s interval it easy to calculate 7(35/5). I had hard-coded this  <code>7</code> into the kernel, the kernel launch parameters, and also in shared memory size calculations.</p>
+<p>However this will not be the case in the real world and an algorithm was needed to calculate this <code>resample-factor</code>. Calculating this number is not easy. There could be cases where the measurements are available at 7s intervals and requiring aggregation into 13s interval or 55s interval or even 300s interval. On top of this there could be “timegaps” when no data is available.</p>
+<p>So to count which specific intervals should be aggregated together. I implemented the following algorithm in the kernel <a href="https://github.com/sjamgade/carbs/blob/5ec998c914e8e01230515be4193a75ef0639ca4e/carbonara.py#L41">count_uniqs</a></p>
+<ul>
+<li>if timestamps <code>t</code> (from round_timestamps) at position <code>n</code> is not same as that at <code>n-1</code>:
+<ul>
+<li>then the thread <code>T</code> is the <code>first</code> one in series of <code>t</code> from <code>n</code>; and should be <code>mark</code>ed</li>
+</ul>
+</li>
+<li>only <code>mark</code>ed thread should continue counting following <code>t</code>'s and stop on encountering something other than <code>t</code>.</li>
+</ul>
+<p>This way at the end each marked thread will have the count of <code>uniqs</code> that of each timestamp that exists.</p>
+<p>This kernel had many efficiency issues, the first being the non-coalesced memory access. The second was due to the divergent nature of the kernel many warps would be less efficient. In some cases this divergence could lead to serialization of “if-else-halfs” (<a href="https://cvw.cac.cornell.edu/gpu/thread_div">the link has a better explanation</a>).</p>
+<p>Yet even with such a naive implementation the benchmark was fast and could beat the CPU benchmark.</p>
+<p>Next step was to link the two kernel (<code>count_uniqs</code> and <code>v3</code>) together and get the final results.</p>
+<p>But after some thought I found that <code>count_uniqs</code> kernel could also do the aggregation as it was already picking the unique timestamps. Thus with some modifications the kernel was able to do both and the kernel (<code>v3</code>) was no longer required.</p>
+<p>I made other small optimizations which turned out as learning:</p>
+<ul>
+<li>there is no need to copy result of <code>round_timestamps</code> back to host memory as <code>count_uniqs</code> could reuse it</li>
+<li>aggregation was a by-product of <code>count_uniqs</code> and so can be other methods of aggregation thus helping to hide latency introduced while copying data to/from GPU</li>
+</ul>
+<h3 id="conclusion">Conclusion</h3>
+<p>Computing on GPU demands intense workloads. This helps to hide the <code>memcpy</code> latency. In case of applications like Gnocchi, Ceilometer-Api and maybe Monasca, if I apply this condition, it is better to do the aggregation when requested rather than on receipt. This is because the amount of data received (for pre-computing) at any moment will always be small in quantity, as compared to already stored data.</p>
+<p>For example:</p>
+<pre><code>    @5s interval for 30 days  &lt; data size analysed in code
+           1.3 million points &lt; 1024*1024*6 points
+</code></pre>
+<p>And in all cases the GPU turned out to be better than the CPU. So if there existed a hypothetical library with such functionality which could do exactly what these applications required then they all could benefit from it.  Such a library would be capable of doing basic aggregations, and also provide an <strong>easy</strong> interface to write <strong>strong</strong> abstractions converting into GPU code, to have custom aggregate functions.</p>
+<p>One might argue that there are already many open source libraries which are capable of pushing computation to the GPU, but one of the important <strong>lessons</strong> from this experiment was:</p>
+<blockquote>
+<p>Writing CUDA code is very domain specific and coming up with a generic solution will require a lot of engineering.<br>
+This engineering is required to shape the solution to the specific needs of the application.<br>
+It would help to create such a library if many applications belonging to the same OpenSource Domain can benefit.</p>
+</blockquote>
+<p>But for that to happen <strong>one</strong> project will have to walk the path and demonstrably set an example for others to follow.  I recommend Gnocchi as that project.</p>
+<p><a href="https://github.com/sjamgade/carbs">Repo</a> <a href="https://github.com/sjamgade/carbs/wiki">Wiki</a></p>
+</div>
+</body>
+
+</html>

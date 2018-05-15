@@ -1,13 +1,13 @@
 Here I have organized my thoughts as I was performing an experiment on [Gnocchi](https://github.com/gnocchixyz/gnocchi/) - the database
 
 
-- [What and Why](intro.md)  
+- [What and Why](intro.html)  
        Its an experiment to explore General-Purpose-GPU compute space where I try to shift computation from CPU to GPU for the OpenSource project Gnocchi 
 
-- [How](profiling.md)  
+- [How](profiling.html)  
       This part goes into implementation details. It explains the iterations based on profiling results.
 
-- [Now What](conclusion.md)  
+- [Now What](conclusion.html)  
       It talks about Gpu-fication of other parts of the library. It also has my learning and conclusions from the experiment. 
 
 
@@ -25,8 +25,4 @@ The repo is organized into various branches.
 
 
 ### Originally published here:
-https://www.suse.com/c/an-experiment-with-gnocchi-the-database-part-1/
-
-https://www.suse.com/c/an-experiment-with-gnocchi-the-database-part-2/
-
-https://www.suse.com/c/an-experiment-with-gnocchi-the-database-part-3/
+[Post 1](https://www.suse.com/c/an-experiment-with-gnocchi-the-database-part-1/), [Post 2](https://www.suse.com/c/an-experiment-with-gnocchi-the-database-part-2/), [Post 3](https://www.suse.com/c/an-experiment-with-gnocchi-the-database-part-3/)

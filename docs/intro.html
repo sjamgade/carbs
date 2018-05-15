@@ -1,0 +1,59 @@
+﻿<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>intro</title>
+  <link rel="stylesheet" href="https://stackedit.io/style.css" />
+</head>
+
+<body class="stackedit">
+  <div class="stackedit__html"><h3 id="background-why">Background (Why):</h3>
+<p>Openstack has component: Ceilometer (Telemetry). Ceilometer was huge and its main purpose was to help with the Monitoring and Metering of whole of th OpenStack. But because of the scale at which OpenStack operates, Ceilometer would often fall behind and become a major bottleneck for the same function it was designed to do. It had one more problem:- Aggregating these measurements and providing them in a more consumable format.</p>
+<p>So it was broken into different parts and this gave rise to a time series database - <a href="https://github.com/gnocchixyz/gnocchi/">Gnocchi.</a>. Gnocchi stores data on the disk in its own custom format. And then using a group of processes on same node. On sharing the storage disk across different nodes, Gnocchi can form a cluster of processes from these nodes to aggregate the data. The received data is referred as metrics, as it is the measured usage of the various resources(like cpu, ram, disk, network) in OpenStack.</p>
+<p>One of the ways Gnocchi is different is the way it handles aggregation. Instead of aggregating the metrics to generate (sum,mean,std-deviation etc) whenever and however they are asked for, Gnocchi makes the user choose on what kind of aggregations should be performed while defining the metrics and calculates and stores the metrics and aggregates immediately on receipt.</p>
+<p>So the user has to tell Gnocchi that the metrics <em>X</em> should be received at interval <em>A</em> but should be also aggregated to interval <em>B</em> to make <em>Y</em> aggregates and then data should be archived after <em>N</em> time.<br>
+For example:<br>
+Receive <em>cpu-usage-vm</em> every <em>5</em> sec and generate <em>sum,mean,std-deviation</em> for <em>1m, 10m, 30m, 1h, 12h, 24h, 7d, 15d, 30d</em>, delete after <em>30days</em>.</p>
+<p>As the received data are immediately aggregated and stored, retrieval is as good as a single disk read. In a way the aggregation problem (as faced by ceilometer, as mentioned above) is never faced and so does not needs solving.  But this pre-computing was still a problem as the amount of data could get really overwhelming. Gnocchi tries to solve this problem by letting a large number of worker aggregate the data forming a cluster over distributed nodes.</p>
+<p>This peculiar way of restricting the problem space and commitment of the range of values for the variables involved in aggregations allowed some space for <strong>Experiments</strong>.</p>
+<h3 id="speeding-up-how">Speeding up (How)</h3>
+<p>The workers working across different nodes have their work partitioned at run time.</p>
+<ul>
+<li>Input size for metrics to be aggregated is already known</li>
+<li>The aggregation intervals are already defined along with the metric</li>
+</ul>
+<p>If one knows there are X points at A intervals to be aggregated to generate Y points at B intervals then this forms a classic case of <strong>Parallelization</strong>, where you can employ Y threads to aggregate (X/Y) points from X, as shown in the following figure.</p>
+
+<table>
+<thead>
+<tr>
+<th align="center"><img src="https://devblogs.nvidia.com/wp-content/uploads/2014/01/reduce.png" alt="Reduction example from devblogs.nvidia.com"></th>
+<th align="center"><img src="https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/productspage/quadro/quadro-desktop/quadro-desktop-k620-297-udtm@2x.jpg" alt="Quadro K620 (Image from Nvidia.com)"></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td align="center">Reduction example from <a href="http://devblogs.nvidia.com">devblogs.nvidia.com</a></td>
+<td align="center">Quadro K620 (Image from <a href="http://Nvidia.com">Nvidia.com</a>)</td>
+</tr>
+</tbody>
+</table><p>Now there are various ways one could implement this <em>parallelization</em> in the form of threads by offloading it to the cores of the CPU. But the poor CPU is already busy juggling processes and there is always some process fighting for the CPU’s attentions. Also the CPU has only so many cores, so the idea was to use a GPGPU to get the massive parallelism required.</p>
+<p>So for this experiment I decided to leverage the GPU my machine was already equipped with, an NVDIA Quadro K620.</p>
+<p>The specs of the GPU can be seen <a href="https://images.nvidia.com/content/pdf/quadro/data-sheets/75509_DS_NV_Quadro_K620_US_NV_HR.pdf">here</a>. It is a medium-grade GPU, with good <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities">compute capability (5.0)</a> and 2GB of ram.</p>
+<h4 id="implementation-is-it-even-possible-">Implementation (is it even possible-?)</h4>
+<p>The first approach was to get at least the benchmark passing and with a speed up.</p>
+<p>The benchmark covered a wide range of data formats and multiple areas of the <a href="https://github.com/gnocchixyz/gnocchi/blob/master/gnocchi/carbonara.py">carbonara library</a>.  It has (De-)Serialization  evaluations, resampling and aggregations (sum,min,max,mean,average), and in addition the input data for all these benchmark evaluation was not just arrays of random values, but arrays of zeros, random floats between in the range [-1,1]. So<br>
+the requirements was to beat all these benchmarks.</p>
+<p>First step was to insert a class in <a href="https://github.com/sjamgade/carbs/blob/04b9db71e0e4c6d14073c4bd827a23e4dd0437ab/carbonara.py#L225">carbonara library (my copy)</a> which could call the CUDA code, and simulate addition with a fixed <a href="https://github.com/sjamgade/carbs/blob/04b9db71e0e4c6d14073c4bd827a23e4dd0437ab/carbonara.py#L194">re-sample rate(30s)</a> and <a href="https://github.com/sjamgade/carbs/blob/04b9db71e0e4c6d14073c4bd827a23e4dd0437ab/carbonara.py#L191">fixed input size</a> for all zeros and continuous numbers as floats.</p>
+<p>This itself gave a performance boost. From here on the game was to increase performance and throughput while keeping the semantics intact.</p>
+<p>Getting the initial kernel going was easy. There was already a speed-up of 5x.</p>
+<p>The first bottleneck was the amount of data processed in one go. The benchmark assumed an input size of 3600 points for calculation.  This number was very low. Reducing 3600 points to 600 points in parallel on a GPU would in the naive implementation about 600 threads (6 aggregates each). As recent GPGPUs  generally have a compute capability &gt; 5. This allows a block to contain a maximum of 2048 threads so 600 was very small, and thus was increased to <code>1024 * 1024 * 6</code></p>
+<p>There is one more reason for the number to be so high. Since the GPU has its own memory input data needs copying from HtoD (host to device i.e. CPU-RAM to GPU-RAM). But even this device memory is not fast enough. Every access to load data (from device memory to L2 cache) for computation is expensive, so to hide the latency lots of computation is recommend. So that while data is loading, any already loaded data can be used for computation. This is just one the ways to hide that latency.</p>
+<p>In the <a href="https://sjamgade.github.io/carbs/profiling.html">part 2</a> I will start with a basic kernel (the piece of CUDA code that executes on GPU), perform some profiling with <a href="https://devblogs.nvidia.com/cuda-pro-tip-nvprof-your-handy-universal-gpu-profiler/">nvprof and visual profiler</a> and apply optimizations to remove the bottlenecks.  In <a href="https://sjamgade.github.io/carbs/conclusion.html">part 3</a> some learning and further GPU-fication of other parts of the library.</p>
+<p><a href="https://github.com/sjamgade/carbs">Repo</a> <a href="https://github.com/sjamgade/carbs/wiki">Wiki</a></p>
+</div>
+</body>
+
+</html>

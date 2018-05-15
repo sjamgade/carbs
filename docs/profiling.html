@@ -1,0 +1,138 @@
+﻿<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>profiling</title>
+  <link rel="stylesheet" href="https://stackedit.io/style.css" />
+</head>
+
+<body class="stackedit">
+  <div class="stackedit__html"><p>In <a href="https://sjamgade.github.io/carbs/intro.html">Part 1</a>, I introduced the problem of metrics aggregations for Ceilometer in OpenStack and how Gnocchi (a time-series database) tries to solve it in a different way. I argued about a possible offloading of work to (Nvida Quadro K620) GPU.</p>
+<p>This part summarizes the iterations applied to the kernel (piece of CUDA code, that executes on GPU). It removes the bottlenecks encountered during profiling. To understand this part some background knowledge about programming on GPU would be good. (I recommend reading <a href="https://nyu-cds.github.io/python-gpu/02-cuda/">this</a> or even <a href="http://charlab.github.io/sphynx/2013/11/18/gpu-terminology/">smaller this</a>)</p>
+<h4 id="v1">v1</h4>
+<p>Based on the discussion in the Implementation section of part 1, I wrote a <a href="https://github.com/sjamgade/carbs/blob/04b9db71e0e4c6d14073c4bd827a23e4dd0437ab/carbonara.py#L251">first version of kernel(v1)</a><br>
+Code:</p>
+<pre class=" language-cpp"><code class="prism  language-cpp">__global__ <span class="token keyword">void</span> <span class="token function">v1</span><span class="token punctuation">(</span><span class="token keyword">float</span> <span class="token operator">*</span>a<span class="token punctuation">,</span> <span class="token keyword">int</span> <span class="token operator">*</span>i<span class="token punctuation">)</span> <span class="token punctuation">{</span>  
+  <span class="token keyword">int</span> perthread<span class="token operator">=</span>i<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">;</span>    
+  <span class="token keyword">int</span> counter <span class="token operator">=</span> i<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>    
+  <span class="token keyword">int</span> col <span class="token operator">=</span> blockIdx<span class="token punctuation">.</span>x <span class="token operator">*</span> blockDim<span class="token punctuation">.</span>x <span class="token operator">+</span> threadIdx<span class="token punctuation">.</span>x<span class="token punctuation">;</span>    
+  <span class="token keyword">int</span> row <span class="token operator">=</span> blockIdx<span class="token punctuation">.</span>y <span class="token operator">*</span> blockDim<span class="token punctuation">.</span>y <span class="token operator">+</span> threadIdx<span class="token punctuation">.</span>y<span class="token punctuation">;</span>    
+  <span class="token keyword">int</span> index <span class="token operator">=</span> col <span class="token operator">*</span> perthread <span class="token operator">+</span> row<span class="token punctuation">;</span>    
+  <span class="token keyword">for</span><span class="token punctuation">(</span><span class="token punctuation">;</span>counter<span class="token punctuation">;</span>counter<span class="token operator">--</span><span class="token punctuation">)</span>    
+    <span class="token function">atomicAdd</span><span class="token punctuation">(</span>a<span class="token operator">+</span>index<span class="token punctuation">,</span> a<span class="token punctuation">[</span>index<span class="token operator">+</span>counter<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>    
+<span class="token punctuation">}</span>
+</code></pre>
+<p>Results :</p>
+<pre><code>Simple continuous range
+  time to aggregate 17.5399780 msec
+  resample(gpu_sum) speed: 2.34 Hz; 427.72102356 msec
+  time to aggregate 56.2980175 msec
+  resample(cpu_sum) speed: 2.84 Hz; 352.295875549 msec
+Just zeros
+  time to aggregate 16.6831017 msec
+  resample(gpu_sum) speed: 3.20 Hz; 312.555074692 msec
+  time to aggregate 56.0901165 msec
+  resample(cpu_sum) speed: 2.87 Hz; 348.960161209 msec
+</code></pre>
+<p>Just firing random requests for data from different threads leads to a problem of <a href="https://cs.stackexchange.com/questions/18229/what-is-memory-coalescing">non-coalesced addressing</a>. Since there is no guarantee of how the scheduler (GPUs have their own scheduler like CPUs) will schedule the <a href="https://en.wikipedia.org/wiki/Thread_block#Warps">warps</a>, the data access patterns from these warps needs to align to achieve maximum throughput of the L2 cache bus. The bandwidth of this bus is device-dependent but mostly it is in multiples of 32 bytes for older GPGPUs and 128 bytes in newer devices.</p>
+<p>The data access pattern in the first kernel was not correct. Also getting the pattern correct is a difficult problem. So, I thought of an alternate solution. This required reducing the number of data requests fired but consuming the responses as soon as possible. So each thread did more work, but also created work in a controlled manner.</p>
+<h4 id="v2">v2</h4>
+<p><a href="https://github.com/sjamgade/carbs/blob/04b9db71e0e4c6d14073c4bd827a23e4dd0437ab/carbonara.py#L261">This is the alternative approach for the kernel(v2).</a>. Here the whole array is divided into chunks and each chunk is refereed as <code>blk</code><br>
+Code:</p>
+<pre class=" language-cpp"><code class="prism  language-cpp">    __global__ <span class="token keyword">void</span> <span class="token function">v2</span><span class="token punctuation">(</span><span class="token keyword">float</span> <span class="token operator">*</span>a<span class="token punctuation">,</span> <span class="token keyword">int</span> <span class="token operator">*</span>i<span class="token punctuation">)</span> <span class="token punctuation">{</span>    
+    <span class="token keyword">int</span> perthread<span class="token operator">=</span>i<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">;</span>    
+    <span class="token keyword">int</span> counter <span class="token operator">=</span> i<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>    
+    <span class="token keyword">int</span> blklimit<span class="token operator">=</span><span class="token number">1024</span><span class="token punctuation">;</span>    
+    <span class="token keyword">int</span> blk<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">;</span>    
+    <span class="token keyword">for</span> <span class="token punctuation">(</span>blk<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">;</span>blk<span class="token operator">&lt;</span>blklimit<span class="token punctuation">;</span>blk<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>    
+	    <span class="token keyword">int</span> counter <span class="token operator">=</span> i<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>    
+	    <span class="token keyword">int</span> col <span class="token operator">=</span> blk <span class="token operator">*</span> blockDim<span class="token punctuation">.</span>x <span class="token operator">+</span> threadIdx<span class="token punctuation">.</span>x<span class="token punctuation">;</span>    
+	    <span class="token keyword">int</span> row <span class="token operator">=</span> blockIdx<span class="token punctuation">.</span>y <span class="token operator">*</span> blockDim<span class="token punctuation">.</span>y <span class="token operator">+</span> threadIdx<span class="token punctuation">.</span>y<span class="token punctuation">;</span>    
+	    <span class="token keyword">int</span> index <span class="token operator">=</span> col <span class="token operator">*</span> perthread <span class="token operator">+</span> row<span class="token punctuation">;</span>    
+	    <span class="token keyword">for</span><span class="token punctuation">(</span><span class="token punctuation">;</span>counter<span class="token punctuation">;</span>counter<span class="token operator">--</span><span class="token punctuation">)</span>    
+	        <span class="token function">atomicAdd</span><span class="token punctuation">(</span>a<span class="token operator">+</span>index<span class="token punctuation">,</span> a<span class="token punctuation">[</span>index<span class="token operator">+</span>counter<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+        <span class="token punctuation">}</span>
+    <span class="token punctuation">}</span>
+</code></pre>
+<p>Results:</p>
+<pre><code>Simple continuous range
+ time to aggregate 21.0869312 msec
+ resample(gpu_sum) speed: 2.04 Hz; 490.113973618 msec
+ time to aggregate 71.5970993 msec
+ resample(cpu_sum) speed: 2.36 Hz; 423.68888855 msec
+Just zeros
+ time to aggregate 20.2741623 msec
+ resample(gpu_sum) speed: 2.67 Hz; 374.500989914 msec
+ time to aggregate 72.5300312 msec
+ resample(cpu_sum) speed: 2.36 Hz; 424.036026001 ms
+</code></pre>
+<p>All threads from one CUDA-<code>block</code> would  chomp upon its own <code>blk</code>. So I had reduced <a href="https://github.com/sjamgade/carbs/blob/v12/v2.pdf">occupancy</a> with less threads. But still  generated enough work to keep the threads busy. Also enough read requests to keep the GPU-RAM (Global Memory) read time hidden by overlapping it with work of  threads from other warps.</p>
+ <img src="https://www.spiedigitallibrary.org/ContentImages/Journals/JBOPFO/21/1/017001/FigureImages/JBO_21_1_017001_f008.png" width="50%" align="right" border="1">
+<p>Even the kernel was doing fine here but nvprof was still reporting efficiency issues.  One of those was the global-memory access pattern. Since each thread was responsible for aggregating the 6 floats, it would load 6 non-contiguous memory locations.  This is a problem in the world of GPUs. As a GPU loads not only one memory location but an entire segment of 128 bytes from global memory into the L2/L1 cache.</p>
+<p>So if 32 threads of a warp request 4 bytes(float) from non-contiguous locations, the GPU would get request for locations that are 24(6*4) bytes apart form each thread in a warp, resulting into 768 (24*32) bytes, falling into 6 (768/128) segments. But since there is only one bus there will be request serialization stalling the warp</p>
+<p>This is a huge waste of bandwidth as only 24 bytes out of 768 bytes are actually used.  There are many ways to circumvent this problem and thus lead to the next iteration.</p>
+<h4 id="v3">v3</h4>
+<p>Code:</p>
+<pre class=" language-cpp"><code class="prism  language-cpp">    __global__ <span class="token keyword">void</span> <span class="token function">v3</span><span class="token punctuation">(</span><span class="token keyword">float</span> <span class="token operator">*</span>a<span class="token punctuation">,</span> <span class="token keyword">int</span> <span class="token operator">*</span>i<span class="token punctuation">)</span> <span class="token punctuation">{</span>    
+    <span class="token keyword">int</span> perthread<span class="token operator">=</span>i<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">;</span>    
+    <span class="token keyword">int</span> gridsize <span class="token operator">=</span> <span class="token number">4</span><span class="token operator">*</span><span class="token number">4</span><span class="token punctuation">;</span>   
+    <span class="token keyword">int</span> blklimit<span class="token operator">=</span><span class="token number">1024</span><span class="token operator">/</span>gridsize<span class="token punctuation">;</span>    
+    <span class="token keyword">int</span> blk<span class="token operator">=</span><span class="token number">1</span><span class="token punctuation">;</span>    
+    <span class="token keyword">int</span> row<span class="token punctuation">,</span> col<span class="token punctuation">,</span> index<span class="token punctuation">;</span>    
+    __shared__ <span class="token keyword">float</span> inter<span class="token punctuation">[</span><span class="token number">6</span><span class="token operator">*</span><span class="token number">1024</span><span class="token operator">/</span><span class="token number">16</span><span class="token punctuation">]</span><span class="token punctuation">;</span>    
+    <span class="token keyword">int</span> counter <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>    
+    <span class="token keyword">for</span> <span class="token punctuation">(</span>blk<span class="token operator">=</span><span class="token number">1</span><span class="token punctuation">;</span>blk<span class="token operator">&lt;</span>blklimit<span class="token punctuation">;</span>blk<span class="token operator">++</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>    
+	    counter <span class="token operator">=</span> perthread<span class="token number">-1</span><span class="token punctuation">;</span>    
+	    col <span class="token operator">=</span> blockIdx<span class="token punctuation">.</span>x <span class="token operator">*</span> blockDim<span class="token punctuation">.</span>x <span class="token operator">+</span> threadIdx<span class="token punctuation">.</span>x <span class="token operator">+</span> blockDim<span class="token punctuation">.</span>x<span class="token operator">*</span>blk<span class="token operator">*</span>perthread<span class="token punctuation">;</span>    
+	    row <span class="token operator">=</span> blockIdx<span class="token punctuation">.</span>y <span class="token operator">*</span> blockDim<span class="token punctuation">.</span>y <span class="token operator">+</span> threadIdx<span class="token punctuation">.</span>y<span class="token punctuation">;</span>    
+	    <span class="token keyword">int</span> tid <span class="token operator">=</span> threadIdx<span class="token punctuation">.</span>x<span class="token punctuation">;</span>    
+	    <span class="token keyword">for</span><span class="token punctuation">(</span>counter<span class="token operator">=</span><span class="token number">0</span><span class="token punctuation">;</span>counter<span class="token operator">&lt;</span>perthread<span class="token punctuation">;</span>counter<span class="token operator">++</span><span class="token punctuation">)</span><span class="token punctuation">{</span>    
+		    index <span class="token operator">=</span> col <span class="token operator">+</span> blockDim<span class="token punctuation">.</span>x<span class="token operator">*</span>counter <span class="token operator">+</span> row<span class="token punctuation">;</span>    
+		    inter<span class="token punctuation">[</span>blockDim<span class="token punctuation">.</span>x <span class="token operator">*</span> counter <span class="token operator">+</span> tid<span class="token punctuation">]</span> <span class="token operator">=</span> a<span class="token punctuation">[</span>index<span class="token punctuation">]</span><span class="token punctuation">;</span>   
+	    <span class="token punctuation">}</span>    
+	    <span class="token function">__syncthreads</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>    
+	    counter <span class="token operator">=</span> perthread<span class="token number">-1</span><span class="token punctuation">;</span>	        
+	    <span class="token keyword">int</span> x <span class="token operator">=</span> <span class="token number">0</span><span class="token punctuation">;</span>    
+	    <span class="token keyword">for</span><span class="token punctuation">(</span><span class="token punctuation">;</span>counter<span class="token punctuation">;</span>counter<span class="token operator">--</span><span class="token punctuation">)</span><span class="token punctuation">{</span>    
+		    x <span class="token operator">+</span><span class="token operator">=</span> inter<span class="token punctuation">[</span>blockDim<span class="token punctuation">.</span>x <span class="token operator">*</span> counter <span class="token operator">+</span> tid<span class="token punctuation">]</span><span class="token punctuation">;</span>    
+	    <span class="token punctuation">}</span>    
+	    a<span class="token punctuation">[</span>index<span class="token punctuation">]</span> <span class="token operator">=</span> x<span class="token punctuation">;</span>
+        <span class="token function">__syncthreads</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>    
+	<span class="token punctuation">}</span>
+ <span class="token punctuation">}</span>
+</code></pre>
+<p>Results:</p>
+<pre><code>Simple continuous range
+  time to aggregate 14.5051479
+  resample(gpu_sum) speed: 1.96 Hz
+  time to aggregate 75.1349926
+  resample(cpu_sum) speed: 2.26 Hz
+Just Zeros
+  time to aggregate 14.0569210
+  resample(gpu_sum) speed: 2.62 Hz
+  time to aggregate 74.8288631
+  resample(cpu_sum) speed: 2.25 Hz
+</code></pre>
+<p><a href="https://github.com/sjamgade/carbs/blob/9a3211808315df75a16ad12bc64da8369146d158/carbonara.py#L181">V3</a> is more “static” because I wrote it to test out things. I call it static because all the numerics involved are precomputed and the kernel will fail with even even a small change in input or blocks size or grid size.</p>
+<p>It uses <strong>shared</strong> memory. CUDA compiler manages the shared memory allocation  per block. So shared memory allocated for block <code>X</code> is not accessible to the threads of block <code>Y</code>. So any writes from threads of block <code>X</code> are visible only to threads of block <code>X</code>. Shared Memory has one other advantage. It is much faster than global memory, and it does not suffers from the addressing coalescing issue as faced by global memory.</p>
+<p>So the approach here was to load all the data required into the shared memory using adjoining threads to load adjoining locations from global memory. Once the shared memory is completely populated (as forced by the <code>__syncthreads</code> call) each thread can go ahead do its aggregations (sum).  Here I have still used the similar concept of <code>blk</code>s from <code>v2</code> as the shared memory is sized in few kilobytes and not in gigabytes like the global memory and therefor needs to used conservatively.</p>
+<p>This was a good improvement over <code>v2</code> and <a href="https://raw.githubusercontent.com/sjamgade/carbs/6db68dd1261f05aa76362f7dd267c85f2d96b870/v3.pdf"><code>nvprof</code> did not report any major efficiency issues with the kernel</a>. But  this did not fit well in the whole solution, because the ratio of time(work-done):time(waiting-to-begin-work) was very bad.</p>
+<p>The picture (execution timeline from Nvdia Visual Proflier) shows a classic problem in case of GPUs. In general there is nothing much to do about it. As you can see most of the time the GPU is siting idle doing only memory copy between CPU and GPU.<br>
+<img src="https://raw.githubusercontent.com/sjamgade/carbs/6db68dd1261f05aa76362f7dd267c85f2d96b870/2018-04-25-162940_1905x340_scrot.png" alt="Profiler timeline for v3 kernel, blue shade is the real kernel execution"></p>
+<pre><code> - Magenta Color               : API call from CPU  to GPU like memalloc, memcpy etc
+ - Golden Color                : Memory copy(Memcpy)
+ - Dark Cyan Color(v1,v2,v3,v4): Actual kernel execution (computation) on GPU
+ - HtoD                        : CPU-RAM to GPU-RAM 
+ - DtoH                        : GPU-RAM to CPU-RAM 
+ - Sync                       : Blocking Call; CPU will wait till the GPU is Done
+</code></pre>
+<p>In most cases the suggestion is to use <a href="https://devblogs.nvidia.com/gpu-pro-tip-cuda-7-streams-simplify-concurrency/">Streams</a>. Streams are “threads” to GPUs what “threads” are to CPUs. Streams are also more like pipelines where the CPU can push work to the GPU and the work will get picked up whenever resources are available. Streams have one more advantage, they run in parallel, the GPU can process work from different streams independently. This property is useful to do compute and <code>memcpy</code> (between host and GPU memory) asynchronously. Since the GPU has different memory and compute engines, these two operations can be overlapped in different streams.</p>
+<img src="https://devblogs.nvidia.com/wp-content/uploads/2012/11/C2050Timeline-1024x670.png" border="1">
+<p>In the <a href="https://sjamgade.github.io/carbs/conclusion.html">next part</a> I will talk about the final iteration and kernel for other parts of the library. I also present my learning and conclusion from this experiment.</p>
+<p><a href="https://github.com/sjamgade/carbs">Repo</a><a href="https://github.com/sjamgade/carbs/wiki">Wiki</a></p>
+</div>
+</body>
+
+</html>
