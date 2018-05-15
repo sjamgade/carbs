@@ -6,11 +6,11 @@ This branch has the version v1 and v2
 ### V3 (final)
 this branch is for version v3 and also the final implementation 
 ### v3.1
-This was intermediate improvement over v3 but the adavantage was not great
+This was intermediate improvement over v3 but the speed-up was not great
 ### v4
-This implements implements the kernel using stream, a more advanced approach
+This implements the kernel using stream, a more advanced approach
 ### threaded
-This is broken approach where work is launched from different threads, but overhead is too high
+Another approach where work is launched from different threads, but overhead is too high
 
 
-For a more detailed guide have a look at the wiki.
+For a more detailed guide have a look at the https://sjamgade.github.io/carbs
